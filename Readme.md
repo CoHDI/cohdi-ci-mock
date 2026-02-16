@@ -1,4 +1,6 @@
 # Readme
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2FCoHDI%2Fcohdi-ci-mock.svg?type=shield)](https://app.fossa.com/projects/git%2Bgithub.com%2FCoHDI%2Fcohdi-ci-mock?ref=badge_shield)
+
 
 This document explains how to start a mock server for the CI environment to test CoHDI.
 
@@ -202,3 +204,7 @@ Please refer to the Helm-based installation method: https://github.com/CoHDI/coh
 
 In the CoHDI configuration, please set the parameters for the CDI management software's ENDPOINT and certificate to point to the mock server's IP address and certificate.
 
+
+
+## License
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2FCoHDI%2Fcohdi-ci-mock.svg?type=large)](https://app.fossa.com/projects/git%2Bgithub.com%2FCoHDI%2Fcohdi-ci-mock?ref=badge_large)
