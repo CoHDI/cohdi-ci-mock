@@ -22,10 +22,15 @@ from flask import Flask, request
 app = Flask(__name__)
 
 CONFIG_PATH = "./config/resources.json"
-K8S_NAMESPACE = "composable-resource-operator-system"
-K8S_PLUGIN_POD = "cro-node-agent"
-K8S_GPU_SMI_CMD="chroot /host-root /usr/bin/nvidia-smi -L"
-K8S_RESCAN_CMD="chroot /host-root /bin/sh -c 'echo 1 > /sys/bus/pci/rescan'"
+K8S_DRIVER_NAMESPACE = "gpu-operator"
+K8S_DRIVER_LABEL_SELECTOR = "app.kubernetes.io/component=nvidia-driver"
+K8S_RESCAN_NAMESPACE = "composable-resource-operator-system"
+K8S_RESCAN_POD_NAME = "cro-node-agent"
+K8S_GPU_SMI_CMD = "/usr/bin/nvidia-smi -L"
+K8S_RESCAN_CMD = "echo 1 > /sys/bus/pci/rescan"
+K8S_LSPCI_CMD = "chroot /host-root lspci"
+K8S_INIT_DRIVER_WAIT_TIMEOUT_SECONDS = int(os.environ.get("K8S_INIT_DRIVER_WAIT_TIMEOUT_SECONDS", "900"))
+K8S_INIT_DRIVER_WAIT_INTERVAL_SECONDS = int(os.environ.get("K8S_INIT_DRIVER_WAIT_INTERVAL_SECONDS", "10"))
 COMPOSABLE_DRA_NAMESPACE = "composable-dra"
 COMPOSABLE_DRA_CONFIGMAP = "composable-dra-dds"
 _K8S_REST_CLIENT = None
@@ -33,6 +38,10 @@ _K8S_EXEC_CLIENT = None
 _K8S_STREAM = None
 _CONFIG_RESOURCES = None
 _MODEL_MAP = None
+_ALLOCATED_RESOURCES_BY_MACHINE = {}
+_DYNAMIC_RESOURCE_SERIALS = set()
+_DYNAMIC_RESOURCE_SERIALS_BY_MACHINE = {}
+_VISIBLE_RESOURCE_SERIALS_BY_MACHINE = {}
 
 def load_config_resources(path):
     if not os.path.exists(path):
@@ -137,27 +146,97 @@ def find_node_name_by_machine_uuid(v1, machine_uuid):
     return None
 
 
-def find_plugin_pod_on_node(v1, node_name):
+def find_driver_pod_on_node(v1, node_name):
     pods = v1.list_namespaced_pod(
-        namespace=K8S_NAMESPACE, field_selector=f"spec.nodeName={node_name}"
+        namespace=K8S_DRIVER_NAMESPACE,
+        field_selector=f"spec.nodeName={node_name}",
+        label_selector=K8S_DRIVER_LABEL_SELECTOR,
     )
     for pod in pods.items:
-        if pod.metadata and pod.metadata.name and K8S_PLUGIN_POD in pod.metadata.name:
+        if is_pod_ready(pod):
             return pod.metadata.name
     return None
 
 
-def exec_on_pod(v1, stream_fn, pod_name, command):
+def is_pod_ready(pod):
+    if not pod.status or pod.status.phase != "Running":
+        return False
+    for condition in pod.status.conditions or []:
+        if condition.type == "Ready" and condition.status == "True":
+            return True
+    return False
+
+
+def find_rescan_pod_on_node(v1, node_name):
+    pods = v1.list_namespaced_pod(
+        namespace=K8S_RESCAN_NAMESPACE, field_selector=f"spec.nodeName={node_name}"
+    )
+    for pod in pods.items:
+        name = pod.metadata.name if pod.metadata else ""
+        if K8S_RESCAN_POD_NAME in name and pod.status and pod.status.phase == "Running":
+            return name
+    return None
+
+
+def exec_on_pod(v1, stream_fn, namespace, pod_name, command):
     return stream_fn(
         v1.connect_get_namespaced_pod_exec,
         pod_name,
-        K8S_NAMESPACE,
+        namespace,
         command=["/bin/sh", "-c", command],
         stderr=True,
         stdin=False,
         stdout=True,
         tty=False,
     )
+
+
+def run_driver_command_on_node(v1_rest, v1_exec, stream_fn, node_name, command):
+    pod_name = find_driver_pod_on_node(v1_rest, node_name)
+    if not pod_name:
+        return None
+    return exec_on_pod(v1_exec, stream_fn, K8S_DRIVER_NAMESPACE, pod_name, command)
+
+
+def run_rescan_command_on_node(v1_rest, v1_exec, stream_fn, node_name, command):
+    pod_name = find_rescan_pod_on_node(v1_rest, node_name)
+    if not pod_name:
+        return None
+    return exec_on_pod(v1_exec, stream_fn, K8S_RESCAN_NAMESPACE, pod_name, command)
+
+
+def run_rescan_on_node(v1_rest, v1_exec, stream_fn, node_name):
+    return run_rescan_command_on_node(
+        v1_rest, v1_exec, stream_fn, node_name, K8S_RESCAN_CMD
+    ) is not None
+
+
+def node_has_nvidia_pci(v1_rest, v1_exec, stream_fn, node_name):
+    output = run_rescan_command_on_node(
+        v1_rest, v1_exec, stream_fn, node_name, K8S_LSPCI_CMD
+    )
+    if output is None:
+        return None
+    normalized_output = output.lower()
+    return "nvidia" in normalized_output or "10de:" in normalized_output
+
+
+def run_nvidia_smi_on_node(v1_rest, v1_exec, stream_fn, node_name):
+    return run_driver_command_on_node(
+        v1_rest, v1_exec, stream_fn, node_name, K8S_GPU_SMI_CMD
+    )
+
+
+def wait_for_node_gpus(v1_rest, v1_exec, stream_fn, node_name):
+    deadline = time.time() + K8S_INIT_DRIVER_WAIT_TIMEOUT_SECONDS
+    while time.time() <= deadline:
+        output = run_nvidia_smi_on_node(v1_rest, v1_exec, stream_fn, node_name)
+        if output:
+            gpus = parse_nvidia_smi_output(output)
+            if gpus:
+                return gpus
+        time.sleep(K8S_INIT_DRIVER_WAIT_INTERVAL_SECONDS)
+    return []
 
 
 def parse_nvidia_smi_output(output):
@@ -172,69 +251,153 @@ def parse_nvidia_smi_output(output):
     return gpus
 
 
-def collect_node_resources(v1_rest, v1_exec, stream_fn, node_name):
-    pod_name = find_plugin_pod_on_node(v1_rest, node_name)
-    if not pod_name:
-        return [], None
-    output = exec_on_pod(v1_exec, stream_fn, pod_name, K8S_GPU_SMI_CMD)
-    gpus = parse_nvidia_smi_output(output)
-    detected_serials = {gpu["uuid"] for gpu in gpus}
-    resources = []
-    for res in get_config_resources():
-        if res.get("res_serial_num") not in detected_serials:
+def register_dynamic_resources(gpus, machine_uuid=None):
+    model_map = get_model_map()
+    resources = get_config_resources()
+    existing_serials = {res.get("res_serial_num") for res in resources}
+    for gpu in gpus:
+        serial = gpu.get("uuid")
+        if not serial:
             continue
+        _DYNAMIC_RESOURCE_SERIALS.add(serial)
+        if machine_uuid:
+            _DYNAMIC_RESOURCE_SERIALS_BY_MACHINE.setdefault(machine_uuid, set()).add(serial)
+            _VISIBLE_RESOURCE_SERIALS_BY_MACHINE.setdefault(machine_uuid, set()).add(serial)
+        if serial in existing_serials:
+            continue
+        model_raw = gpu.get("model")
+        model = model_map.get(model_raw, model_raw)
         resources.append(
             {
-                "res_uuid": res.get("res_uuid"),
-                "res_name": "dummy",
-                "res_type": "gpu",
-                "res_status": 4,
-                "res_op_status": "0",
-                "res_serial_num": res.get("res_serial_num"),
-                "res_spec": {
-                    "condition": [
-                        {
-                            "column": "model",
-                            "operator": "eq",
-                            "value": res.get("model"),
-                        }
-                    ]
-                },
+                "res_uuid": str(uuid.uuid4()),
+                "res_serial_num": serial,
+                "model": model,
             }
         )
+        existing_serials.add(serial)
+
+
+def format_resource(res):
+    return {
+        "res_uuid": res.get("res_uuid"),
+        "res_name": "dummy",
+        "res_type": "gpu",
+        "res_status": 4,
+        "res_op_status": "0",
+        "res_serial_num": res.get("res_serial_num"),
+        "res_spec": {
+            "condition": [
+                {
+                    "column": "model",
+                    "operator": "eq",
+                    "value": res.get("model"),
+                }
+            ]
+        },
+    }
+
+
+def get_allocated_resources(machine_uuid):
+    return _ALLOCATED_RESOURCES_BY_MACHINE.get(machine_uuid, [])
+
+
+def get_dynamic_serials(machine_uuid=None):
+    if not machine_uuid:
+        return _DYNAMIC_RESOURCE_SERIALS
+    return _DYNAMIC_RESOURCE_SERIALS_BY_MACHINE.get(machine_uuid, set())
+
+
+def get_visible_serials(machine_uuid):
+    return _VISIBLE_RESOURCE_SERIALS_BY_MACHINE.get(machine_uuid, set())
+
+
+def set_resources_visible(machine_uuid, resources):
+    visible_serials = _VISIBLE_RESOURCE_SERIALS_BY_MACHINE.setdefault(machine_uuid, set())
+    for res in resources:
+        serial = res.get("res_serial_num")
+        if serial:
+            visible_serials.add(serial)
+
+
+def set_resource_hidden(machine_uuid, resource_uuid=None):
+    if machine_uuid not in _VISIBLE_RESOURCE_SERIALS_BY_MACHINE:
+        return
+    if not resource_uuid:
+        _VISIBLE_RESOURCE_SERIALS_BY_MACHINE.pop(machine_uuid, None)
+        return
+    for res in get_config_resources():
+        if res.get("res_uuid") == resource_uuid:
+            _VISIBLE_RESOURCE_SERIALS_BY_MACHINE[machine_uuid].discard(
+                res.get("res_serial_num")
+            )
+            break
+
+
+def collect_node_resources(machine_uuid=None):
+    resources = []
+    seen_serials = set()
+
+    if machine_uuid:
+        visible_serials = get_visible_serials(machine_uuid)
+        for res in get_config_resources():
+            serial = res.get("res_serial_num")
+            if serial not in visible_serials:
+                continue
+            resources.append(format_resource(res))
+            seen_serials.add(serial)
+
+        for res in get_allocated_resources(machine_uuid):
+            serial = res.get("res_serial_num")
+            if serial in seen_serials:
+                continue
+            resources.append(format_resource(res))
+            seen_serials.add(serial)
+
     return resources, None
+
+
+def allocate_resources(machine_uuid, model, res_num):
+    allocated = _ALLOCATED_RESOURCES_BY_MACHINE.setdefault(machine_uuid, [])
+    allocated_serials = {
+        res.get("res_serial_num")
+        for resources in _ALLOCATED_RESOURCES_BY_MACHINE.values()
+        for res in resources
+    }
+    candidates = []
+    dynamic_serials = get_dynamic_serials(machine_uuid)
+    for res in get_config_resources():
+        serial = res.get("res_serial_num")
+        if serial not in dynamic_serials:
+            continue
+        if res.get("model") != model or serial in allocated_serials:
+            continue
+        candidates.append(res)
+        if len(candidates) == res_num:
+            break
+
+    if len(candidates) < res_num:
+        return []
+
+    allocated.extend(candidates)
+    set_resources_visible(machine_uuid, candidates)
+    return [format_resource(res) for res in candidates]
 
 
 def init_dynamic_resources():
     v1_rest, v1_exec, stream_fn, err = get_k8s_client()
     if err:
         return
-    model_map = get_model_map()
     nodes = v1_rest.list_node().items
-    resources = get_config_resources()
-    existing_serials = {res.get("res_serial_num") for res in resources}
     for node in nodes:
         node_name = node.metadata.name
-        pod_name = find_plugin_pod_on_node(v1_rest, node_name)
-        if not pod_name:
+        provider_id = (node.spec.provider_id if node.spec else None) or ""
+        machine_uuid = normalize_machine_uuid(provider_id)
+        if not run_rescan_on_node(v1_rest, v1_exec, stream_fn, node_name):
             continue
-        exec_on_pod(v1_exec, stream_fn, pod_name, K8S_RESCAN_CMD)
-        output = exec_on_pod(v1_exec, stream_fn, pod_name, K8S_GPU_SMI_CMD)
-        gpus = parse_nvidia_smi_output(output)
-        for gpu in gpus:
-            serial = gpu.get("uuid")
-            if not serial or serial in existing_serials:
-                continue
-            model_raw = gpu.get("model")
-            model = model_map.get(model_raw, model_raw)
-            resources.append(
-                {
-                    "res_uuid": str(uuid.uuid4()),
-                    "res_serial_num": serial,
-                    "model": model,
-                }
-            )
-            existing_serials.add(serial)
+        if node_has_nvidia_pci(v1_rest, v1_exec, stream_fn, node_name) is not True:
+            continue
+        gpus = wait_for_node_gpus(v1_rest, v1_exec, stream_fn, node_name)
+        register_dynamic_resources(gpus, machine_uuid)
 
 
 def collect_machine_list():
@@ -247,7 +410,10 @@ def collect_machine_list():
     for _idx, node in enumerate(nodes, start=1):
         provider_id = (node.spec.provider_id if node.spec else None) or ""
         machine_uuid = normalize_machine_uuid(provider_id)
-        resources, res_err = collect_node_resources(v1_rest, v1_exec, stream_fn, node.metadata.name)
+        pci_present = node_has_nvidia_pci(v1_rest, v1_exec, stream_fn, node.metadata.name)
+        if pci_present is False:
+            set_resource_hidden(machine_uuid)
+        resources, res_err = collect_node_resources(machine_uuid)
         if res_err:
             return None, res_err
         machines.append(
@@ -378,15 +544,16 @@ def get_available_machines(m):
     model = extract_model_from_request()
     if not model:
         return json.dumps({"error": "invalid_parameter"}), 400, {"Content-Type": "application/json"}
-    data, err = collect_machine_list()
-    if err:
-        return json.dumps({"error": err}), 500, {"Content-Type": "application/json"}
-    attached_serials = set()
-    for machine in data["data"]["machines"]:
-        for res in machine.get("resources", []):
-            attached_serials.add(res.get("res_serial_num"))
+    attached_serials = {
+        res.get("res_serial_num")
+        for resources in _ALLOCATED_RESOURCES_BY_MACHINE.values()
+        for res in resources
+    }
+    dynamic_serials = get_dynamic_serials(m)
     available_count = 0
     for res in get_config_resources():
+        if res.get("res_serial_num") not in dynamic_serials:
+            continue
         if res.get("model") != model:
             continue
         if res.get("res_serial_num") in attached_serials:
@@ -410,34 +577,13 @@ def patch_devices_fm(m):
     if not model or res_num is None or res_num < 1:
         return json.dumps({"error": "invalid_parameter"}), 400, {"Content-Type": "application/json"}
 
-    pod_name = find_plugin_pod_on_node(v1_rest, node_name)
-    if not pod_name:
-        return json.dumps({"error": "plugin pod not found"}), 500, {"Content-Type": "application/json"}
+    if not run_rescan_on_node(v1_rest, v1_exec, stream_fn, node_name):
+        return json.dumps({"error": "rescan pod not found"}), 500, {"Content-Type": "application/json"}
 
-    before_resources, err = collect_node_resources(v1_rest, v1_exec, stream_fn, node_name)
-    if err:
-        return json.dumps({"error": err}), 500, {"Content-Type": "application/json"}
-
-    exec_on_pod(v1_exec, stream_fn, pod_name, K8S_RESCAN_CMD)
-
-    after_resources, err = collect_node_resources(v1_rest, v1_exec, stream_fn, node_name)
-    if err:
-        return json.dumps({"error": err}), 500, {"Content-Type": "application/json"}
-
-    before_serials = {res["res_serial_num"] for res in before_resources}
-    after_by_serial = {res["res_serial_num"]: res for res in after_resources}
-    diff_resources = []
-    for serial, res in after_by_serial.items():
-        if serial in before_serials:
-            continue
-        conditions = res.get("res_spec", {}).get("condition", [])
-        if any(cond.get("column") == "model" and cond.get("value") == model for cond in conditions):
-            diff_resources.append(res)
-
-    if len(diff_resources) < res_num:
+    response_resources = allocate_resources(m, model, res_num)
+    if len(response_resources) < res_num:
         return json.dumps({"error": "insufficient_resources"}), 404, {"Content-Type": "application/json"}
 
-    response_resources = diff_resources[:res_num]
     response = {
         "data": {
             "machines": [
@@ -457,6 +603,33 @@ def patch_devices_fm(m):
 
 @app.route("/fabric_manager/api/v1/machines/<m>/update", methods=["DELETE"])
 def delete_devices_fm(m):
+    payload = request.get_json(silent=True) or {}
+    resource_uuid = None
+    tenants = payload.get("tenants", {})
+    machines = tenants.get("machines", [])
+    for machine in machines:
+        resources = machine.get("resources", [])
+        for resource in resources:
+            res_specs = resource.get("res_specs", [])
+            for res_spec in res_specs:
+                resource_uuid = res_spec.get("res_uuid")
+                if resource_uuid:
+                    break
+            if resource_uuid:
+                break
+        if resource_uuid:
+            break
+
+    if resource_uuid and m in _ALLOCATED_RESOURCES_BY_MACHINE:
+        _ALLOCATED_RESOURCES_BY_MACHINE[m] = [
+            res
+            for res in _ALLOCATED_RESOURCES_BY_MACHINE[m]
+            if res.get("res_uuid") != resource_uuid
+        ]
+        set_resource_hidden(m, resource_uuid)
+    elif not resource_uuid:
+        _ALLOCATED_RESOURCES_BY_MACHINE.pop(m, None)
+        set_resource_hidden(m)
     return "{}", 200, {"Content-Type": "application/json"}
 
 @app.route("/id_manager/realms/<realm>/protocol/openid-connect/token", methods=["POST"])
