@@ -1,0 +1,393 @@
+name: CoHDI GPU Pod Deploy Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      composable_dra_driver_tag:
+        description: 'Expected deployed tag for composable-dra-driver (empty = skip check)'
+        required: false
+        default: ''
+      composable_resource_operator_tag:
+        description: 'Expected deployed tag for composable-resource-operator (empty = skip check)'
+        required: false
+        default: ''
+      dynamic_device_scaler_tag:
+        description: 'Expected deployed tag for dynamic-device-scaler (empty = skip check)'
+        required: false
+        default: ''
+  workflow_call:
+    inputs:
+      composable_dra_driver_tag:
+        required: false
+        type: string
+        default: ''
+      composable_resource_operator_tag:
+        required: false
+        type: string
+        default: ''
+      dynamic_device_scaler_tag:
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: gpu-pod-deploy-test
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: [ self-hosted, ci-management ]
+    steps:
+      - name: Verify the actor is a maintainer
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          APP_BOT="9tq1uvk1riibxjguk3o1aqsc7dq4wwqjja[bot]"
+          ORG="CoHDI"
+
+          if [ "${{ github.triggering_actor }}" = "$APP_BOT" ]; then
+            echo "Actor OK: dispatched by the $ORG App (the trigger workflow gated the human actor)"
+            exit 0
+          fi
+          ROLE=$(gh api "repos/${{ github.repository }}/collaborators/${{ github.triggering_actor }}/permission" --jq .role_name || true)
+          if [ "$ROLE" != "admin" ] && [ "$ROLE" != "maintain" ]; then
+            echo "ERROR: ${{ github.triggering_actor }} (role: ${ROLE:-unknown}) — running the GPU pod test (it restarts mock-server and cleans cluster state) requires the maintain role or higher"
+            exit 1
+          fi
+          echo "Actor OK: ${{ github.triggering_actor }} (role: $ROLE)"
+
+      - name: Setup kubeconfig
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_CICDVM }}" > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Check cluster status
+        run: |
+          set -euo pipefail
+          kubectl get nodes
+          echo "=== ResourceSlices ==="
+          kubectl get resourceslices
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Wait for NVIDIA stack to be ready on ci-worker
+        run: |
+          set -euo pipefail
+          echo "Waiting for the NVIDIA driver daemonset..."
+          for i in $(seq 1 150); do
+            DESIRED=$(kubectl get ds nvidia-driver-daemonset -n gpu-operator -o jsonpath='{.status.desiredNumberScheduled}')
+            READY=$(kubectl get ds nvidia-driver-daemonset -n gpu-operator -o jsonpath='{.status.numberReady}')
+            if [ -n "$DESIRED" ] && [ "$DESIRED" -gt 0 ] && [ "$READY" = "$DESIRED" ]; then
+              echo "driver daemonset ready ($READY/$DESIRED)"
+              break
+            fi
+            echo "waiting for driver daemonset... (${READY:-0}/${DESIRED:-?}) ($i/150)"
+            if [ "$i" -eq 150 ]; then
+              echo "ERROR: nvidia-driver-daemonset did not become ready in time"
+              echo "=== driver pod state ==="
+              kubectl get pods -n gpu-operator -o wide || true
+              echo "=== driver pod logs (tail) ==="
+              kubectl logs -n gpu-operator ds/nvidia-driver-daemonset --all-containers --tail=40 2>&1 || true
+              exit 1
+            fi
+            sleep 10
+          done
+          echo "Waiting for nvidia-operator-validator (driver + toolkit validated)..."
+          kubectl rollout status ds/nvidia-operator-validator -n gpu-operator --timeout=900s
+          echo "Waiting for the NVIDIA DRA kubelet plugin..."
+          kubectl rollout status ds/dra-driver-nvidia-gpu-kubelet-plugin -n dra-driver-nvidia-gpu --timeout=600s
+          echo "NVIDIA stack is ready"
+
+      - name: Verify deployed component tags match expectations
+        env:
+          CDD_TAG: ${{ inputs.composable_dra_driver_tag }}
+          CRO_TAG: ${{ inputs.composable_resource_operator_tag }}
+          DDS_TAG: ${{ inputs.dynamic_device_scaler_tag }}
+        run: |
+          set -euo pipefail
+          get_tag () {
+            case "$1" in
+              composable-dra-driver)
+                kubectl get deployment composable-dra-driver -n composable-dra \
+                  -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null | sed 's/^.*://' || true
+                ;;
+              composable-resource-operator)
+                kubectl get deployment composable-resource-operator-controller-manager -n composable-resource-operator-system \
+                  -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null | sed 's/^.*://' || true
+                ;;
+              dynamic-device-scaler)
+                kubectl get deployment dds-controller-manager -n composable-dra \
+                  -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null | sed 's/^.*://' || true
+                ;;
+            esac
+          }
+
+          FAILED=0
+          check_one () {
+            component="$1"
+            expected="$2"
+            if [ -z "$expected" ]; then
+              echo "$component: no expected tag given, skipping check"
+              return
+            fi
+            actual=$(get_tag "$component")
+            if [ "$actual" = "$expected" ]; then
+              echo "OK: $component is deployed with expected tag '$expected'"
+            else
+              echo "ERROR: $component is deployed with tag '${actual:-<not deployed>}', expected '$expected'"
+              FAILED=1
+            fi
+          }
+
+          check_one composable-dra-driver "$CDD_TAG"
+          check_one composable-resource-operator "$CRO_TAG"
+          check_one dynamic-device-scaler "$DDS_TAG"
+
+          if [ "$FAILED" -eq 1 ]; then
+            echo "ERROR: one or more components are not running the expected image tag, aborting test"
+            exit 1
+          fi
+
+      - name: Restart mock-server
+        run: |
+          set -euo pipefail
+          if ! timeout 30 kubectl delete pod mock-server -n default --ignore-not-found; then
+            echo "Graceful delete of mock-server timed out, forcing..."
+            kubectl delete pod mock-server -n default --ignore-not-found --grace-period=0 --force
+          fi
+          if ! kubectl apply -f .github/manifests/mock-server.yaml; then
+            echo "ERROR: failed to apply mock-server manifest"
+            exit 1
+          fi
+          echo "Waiting for mock-server to be ready..."
+          if ! kubectl wait --for=condition=ready pod mock-server -n default --timeout=120s; then
+            echo "ERROR: mock-server did not become ready in time"
+            kubectl describe pod mock-server -n default
+            exit 1
+          fi
+          kubectl get pod mock-server -n default -o wide
+          SVC_IP=$(kubectl get svc mock-server -n default -o jsonpath='{.spec.clusterIP}')
+          echo "Waiting for mock-server to actually serve on https://$SVC_IP ..."
+          for i in $(seq 1 60); do
+            if ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no ci-cp "curl -k -m 5 -s -o /dev/null https://$SVC_IP/"; then
+              echo "mock-server is serving (after ~$((i*10-10))s)"
+              break
+            fi
+            echo "mock-server not serving yet... ($i/60)"
+            if [ "$i" -eq 60 ]; then
+              echo "ERROR: mock-server never started serving on 443 (init_dynamic_resources likely stuck — check NVIDIA driver health on the nodes)"
+              kubectl logs mock-server -n default --tail=30 || true
+              exit 1
+            fi
+            sleep 10
+          done
+
+      - name: Cleanup previous test resources
+        run: |
+          set -euo pipefail
+          for cr in $(kubectl get composableresources -o name 2>/dev/null); do
+            STATE=$(kubectl get "$cr" -o jsonpath='{.status.state}' 2>/dev/null || true)
+            if [ "$STATE" = "Detaching" ]; then
+              echo "Force-cleaning stuck $cr (state=Detaching)"
+              kubectl delete "$cr" --ignore-not-found --wait=false
+              kubectl patch "$cr" --type=merge -p '{"metadata":{"finalizers":null}}' || true
+            fi
+          done
+
+          TAINT_RULES=$(kubectl get devicetaintrules -o name 2>/dev/null || true)
+          if [ -n "$TAINT_RULES" ]; then
+            echo "Deleting stale DeviceTaintRule(s): $TAINT_RULES"
+            kubectl delete devicetaintrules --all
+          fi
+
+          if ! timeout 30 kubectl delete -f .github/manifests/gpu-test-pod.yaml --ignore-not-found; then
+            echo "Graceful delete of gpu-test-pod timed out, forcing..."
+            kubectl delete pod gpu-test-pod -n default --ignore-not-found --grace-period=0 --force
+            kubectl delete resourceclaim single-gpu -n default --ignore-not-found
+          fi
+
+          CR_JSON=$(kubectl get composabilityrequests -o json)
+          CR_NAMES=$(echo "$CR_JSON" \
+            | jq -r '.items[] | select(.spec.target_node=="ci-worker" and .spec.model=="gpu.nvidia.com") | .metadata.name')
+
+          if [ -n "$CR_NAMES" ]; then
+            echo "Found leftover ComposabilityRequest(s), forcing detach: $CR_NAMES"
+            for name in $CR_NAMES; do
+              kubectl patch composabilityrequest "$name" --type=merge -p '{"spec":{"force_detach":true}}'
+              kubectl delete composabilityrequest "$name" --ignore-not-found
+            done
+          fi
+
+          echo "Waiting for GPU to detach from ci-worker..."
+          for i in $(seq 1 18); do
+            SLICES=$(kubectl get resourceslices)
+            if ! echo "$SLICES" | grep -E "ci-worker.*gpu.nvidia.com" > /dev/null; then
+              echo "OK: No ResourceSlices on ci-worker"
+              break
+            fi
+            echo "Waiting... ($i/18)"
+            if [ "$i" -eq 18 ]; then
+              echo "WARN: GPU was not detached within 90s, forcing ResourceSlice cleanup"
+              kubectl get resourceslices
+              kubectl get composableresource -o wide
+              kubectl delete resourceslices --field-selector spec.driver=gpu.nvidia.com,spec.nodeName=ci-worker --ignore-not-found
+            fi
+            sleep 5
+          done
+
+      - name: Verify GPU not visible on worker node (before deploy)
+        run: |
+          set -euo pipefail
+          echo "=== ResourceSlices on worker node before deploy ==="
+          SLICES=$(kubectl get resourceslices)
+          if echo "$SLICES" | grep -E "ci-worker.*gpu.nvidia.com"; then
+            echo "ERROR: ResourceSlices already exist on ci-worker before deploy"
+            exit 1
+          else
+            echo "OK: No ResourceSlices on ci-worker (expected)"
+          fi
+
+      - name: Deploy ResourceClaim and Pod
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 60); do
+            DESIRED=$(kubectl get ds nvidia-driver-daemonset -n gpu-operator -o jsonpath='{.status.desiredNumberScheduled}')
+            READY=$(kubectl get ds nvidia-driver-daemonset -n gpu-operator -o jsonpath='{.status.numberReady}')
+            if [ -n "$DESIRED" ] && [ "$DESIRED" -gt 0 ] && [ "$READY" = "$DESIRED" ]; then
+              echo "driver daemonset ready ($READY/$DESIRED)"
+              break
+            fi
+            echo "waiting for driver daemonset... (${READY:-0}/${DESIRED:-?}) ($i/60)"
+            if [ "$i" -eq 60 ]; then
+              echo "ERROR: nvidia-driver-daemonset did not become ready in time"
+              exit 1
+            fi
+            sleep 10
+          done
+          kubectl rollout status ds/dra-driver-nvidia-gpu-kubelet-plugin -n dra-driver-nvidia-gpu --timeout=300s
+          kubectl apply -f .github/manifests/gpu-test-pod.yaml
+
+      - name: Wait for Pod Running
+        run: |
+          set -euo pipefail
+          echo "Waiting for Pod to be Running..."
+          if ! kubectl wait --for=condition=ready pod gpu-test-pod --timeout=1200s; then
+            echo "ERROR: gpu-test-pod did not become ready in time"
+            kubectl describe pod gpu-test-pod
+            echo "=== fabric-path diagnostics ==="
+            echo "--- resourceslices (is the node GPU slice there?) ---"
+            kubectl get resourceslices -o wide || true
+            echo "--- ci-worker nvidia labels ---"
+            kubectl get node ci-worker -o jsonpath='{.metadata.labels}' | tr ',' '\n' | grep -i nvidia || echo "(no nvidia labels)"
+            echo "--- nvidia DRA plugin pods ---"
+            kubectl get pods -n dra-driver-nvidia-gpu -o wide || true
+            echo "--- nvidia DRA kubelet plugin logs ---"
+            kubectl logs -n dra-driver-nvidia-gpu ds/dra-driver-nvidia-gpu-kubelet-plugin --all-containers --tail=30 2>&1 || true
+            echo "--- resourceclaim single-gpu (full) ---"
+            kubectl get resourceclaim single-gpu -o yaml || true
+            echo "--- ci-worker node GPU slice (full) ---"
+            for rs in $(kubectl get resourceslices -o name); do
+              NODE=$(kubectl get "$rs" -o jsonpath='{.spec.nodeName}' 2>/dev/null || true)
+              DRIVER=$(kubectl get "$rs" -o jsonpath='{.spec.driver}' 2>/dev/null || true)
+              if [ "$NODE" = "ci-worker" ] && [ "$DRIVER" = "gpu.nvidia.com" ]; then
+                kubectl get "$rs" -o yaml
+              fi
+            done
+            kubectl get composabilityrequests -o yaml || true
+            kubectl get composableresources -o custom-columns='NAME:.metadata.name,CREATED:.metadata.creationTimestamp,STATE:.status.state,ERROR:.status.error' || true
+            echo "=== CRO logs (tail) ==="
+            kubectl logs -n composable-resource-operator-system deployment/composable-resource-operator-controller-manager --tail=60 || true
+            echo "=== DDS logs (tail) ==="
+            kubectl logs -n composable-dra deployment/dds-controller-manager --tail=40 || true
+            echo "=== mock-server logs (tail) ==="
+            kubectl logs mock-server -n default --tail=40 || true
+            exit 1
+          fi
+          echo "=== Pod is Running ==="
+          kubectl get pods gpu-test-pod
+          echo "=== ResourceClaim ==="
+          kubectl describe resourceclaim | grep -A20 "Status:"
+
+      - name: Verify GPU visible on worker node (after deploy)
+        run: |
+          set -euo pipefail
+          echo "=== Check ResourceSlices on ci-worker after attach ==="
+          SLICES=$(kubectl get resourceslices)
+          if echo "$SLICES" | grep -E "ci-worker.*gpu.nvidia.com"; then
+            echo "OK: GPU attached to node"
+          else
+            echo "ERROR: GPU not attached to node"
+            exit 1
+          fi
+
+          echo "=== ResourceClaim Allocation check ==="
+          STATE=$(kubectl get resourceclaim single-gpu -o jsonpath='{.status.allocation}')
+          if [ -n "$STATE" ]; then
+            echo "OK: ResourceClaim is allocated"
+            kubectl describe resourceclaim single-gpu | grep -A30 "Status:"
+          else
+            echo "ERROR: ResourceClaim is not allocated"
+            exit 1
+          fi
+
+          echo "=== nvidia-smi from test Pod ==="
+          if ! kubectl exec gpu-test-pod -- nvidia-smi -L; then
+            echo "ERROR: nvidia-smi failed - GPU not properly attached"
+            exit 1
+          fi
+          echo "OK: GPU is visible from test Pod"
+
+          echo "=== ComposableResource ==="
+          if ! kubectl get composableresource -A; then
+            echo "ERROR: No ComposableResource found"
+            exit 1
+          fi
+
+      - name: Delete Pod
+        run: |
+          set -euo pipefail
+          if ! timeout 30 kubectl delete -f .github/manifests/gpu-test-pod.yaml --ignore-not-found; then
+            echo "Graceful delete of gpu-test-pod timed out, forcing..."
+            kubectl delete pod gpu-test-pod -n default --ignore-not-found --grace-period=0 --force
+            kubectl delete resourceclaim single-gpu -n default --ignore-not-found
+          fi
+          echo "=== Pod deleted ==="
+
+      - name: Wait for GPU detach
+        run: |
+          set -euo pipefail
+          echo "Waiting for GPU to be detached from node..."
+          for i in $(seq 1 120); do
+            SLICES=$(kubectl get resourceslices)
+            if echo "$SLICES" | grep -E "ci-worker.*gpu.nvidia.com"; then
+              echo "WARNING: GPU still attached to node"
+            else
+              echo "OK: GPU detached from node (expected)"
+              break
+            fi
+            echo "Waiting... ($i/120)"
+            if [ "$i" -eq 120 ]; then
+              echo "ERROR: GPU was not detached within timeout"
+              echo "=== Final ResourceSlices ==="
+              kubectl get resourceslices
+              exit 1
+            fi
+            sleep 10
+          done
+          echo "=== Final ResourceSlices ==="
+          kubectl get resourceslices
+
+      - name: Cleanup
+        if: always()
+        run: |
+          set -euo pipefail
+          if ! timeout 30 kubectl delete -f .github/manifests/gpu-test-pod.yaml --ignore-not-found; then
+            echo "Graceful delete of gpu-test-pod timed out, forcing..."
+            kubectl delete pod gpu-test-pod -n default --ignore-not-found --grace-period=0 --force
+            kubectl delete resourceclaim single-gpu -n default --ignore-not-found
+          fi
+          echo "=== Cleanup done ==="

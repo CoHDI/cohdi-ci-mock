@@ -1,0 +1,46 @@
+name: Start CI Instances
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+concurrency:
+  group: ci-instances
+  cancel-in-progress: false
+
+jobs:
+  start-instances:
+    runs-on: [ self-hosted, ci-management ]
+    steps:
+      - name: Verify the actor is a maintainer
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail        
+          APP_BOT="9tq1uvk1riibxjguk3o1aqsc7dq4wwqjja[bot]"
+          ORG="CoHDI"
+          
+          if [ "${{ github.triggering_actor }}" = "$APP_BOT" ]; then
+            echo "Actor OK: dispatched by the $ORG App (the trigger workflow gated the human actor)"
+            exit 0
+          fi
+          ROLE=$(gh api "repos/${{ github.repository }}/collaborators/${{ github.triggering_actor }}/permission" --jq .role_name || true)
+          if [ "$ROLE" != "admin" ] && [ "$ROLE" != "maintain" ]; then
+            echo "ERROR: ${{ github.triggering_actor }} (role: ${ROLE:-unknown}) — managing the CI instances requires the maintain role or higher"
+            exit 1
+          fi
+          echo "Actor OK: ${{ github.triggering_actor }} (role: $ROLE)"
+
+      - name: Start ci-cp
+        shell: bash
+        continue-on-error: false
+        run: |
+          set -euo pipefail
+          gcloud compute instances start ci-cp --zone=us-central1-c --project=cicd-for-the-cohdi-project
+
+      - name: Start ci-worker
+        shell: bash
+        continue-on-error: false
+        run: |
+          set -euo pipefail
+          gcloud compute instances start ci-worker --zone=us-central1-a --project=cicd-for-the-cohdi-project
