@@ -1,0 +1,51 @@
+name: CoHDI Local Docker Images Cleanup
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: cohdi-component-deploy-test
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  cleanup:
+    runs-on: [ self-hosted, ci-management ]
+    steps:
+      - name: Verify the actor is a maintainer
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ROLE=$(gh api "repos/${{ github.repository }}/collaborators/${{ github.triggering_actor }}/permission" --jq .role_name || true)
+          if [ "$ROLE" != "admin" ] && [ "$ROLE" != "maintain" ]; then
+            echo "ERROR: ${{ github.triggering_actor }} (role: ${ROLE:-unknown}) — pruning the ci-management Docker cache/images requires the maintain role or higher"
+            exit 1
+          fi
+          echo "Actor OK: ${{ github.triggering_actor }} (role: $ROLE)"
+
+      - name: Disk usage before cleanup
+        run: |
+          set -euo pipefail
+          echo "=== Host disk usage ==="
+          df -h /
+          echo "=== Docker disk usage ==="
+          docker system df
+
+      - name: Prune build cache
+        run: |
+          set -euo pipefail
+          docker builder prune -af
+
+      - name: Prune unused local images
+        run: |
+          set -euo pipefail
+          docker image prune -af
+
+      - name: Disk usage after cleanup
+        run: |
+          set -euo pipefail
+          echo "=== Host disk usage ==="
+          df -h /
+          echo "=== Docker disk usage ==="
+          docker system df

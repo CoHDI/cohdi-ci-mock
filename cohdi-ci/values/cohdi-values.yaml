@@ -1,0 +1,90 @@
+# Based on the default values.yaml of the upstream CoHDI chart:
+#   https://github.com/CoHDI/cohdi-chart/blob/main/values.yaml
+# Local changes for this mock-CDI test environment:
+#   - deviceInfo: Tesla T4 added as index 4 (ci-worker's real GPU);
+#     cannot-coexist-with lists extended accordingly
+#   - fabricIdRange: "[0]" -> '[1]' — must match the fabric_id the mock
+#     reports (CoHDI/cohdi-ci-mock's app.py hardcodes fabric_id: 1)
+#   - CDI_ENDPOINT: fixed hostname -> CDI_ENDPOINT_PLACEHOLDER (replaced
+#     with the mock-server ClusterIP at deploy time, together with
+#     HOST_ALIAS_IP_PLACEHOLDER in hostAliases)
+#   - fti_cdi: dummy credentials for the mock backend
+global:
+  common:
+    configData:
+      deviceInfo: |
+        - index: 1
+          cdi-model-name: "a100"
+          dra-attributes:
+            productName: "NVIDIA A100 80GB PCIe"
+            type: "gpu"
+            uuid: ""
+          driver-name: "gpu.nvidia.com"
+          k8s-device-name: "nvidia-a100-80"
+          cannot-coexist-with: [2,3,4]
+        - index: 2
+          cdi-model-name: "L40S"
+          dra-attributes:
+            productName: "NVIDIA L40S"
+            type: "gpu"
+            uuid: ""
+          driver-name: "gpu.nvidia.com"
+          k8s-device-name: "nvidia-l40s"
+          cannot-coexist-with: [1,3,4]
+        - index: 3
+          cdi-model-name: "a30"
+          dra-attributes:
+            productName: "NVIDIA A30"
+            type: "gpu"
+            uuid: ""
+          driver-name: "gpu.nvidia.com"
+          k8s-device-name: "nvidia-a30"
+          cannot-coexist-with: [1,2,4]
+        - index: 4
+          cdi-model-name: "t4"
+          dra-attributes:
+            productName: "Tesla T4"
+            type: "gpu"
+            uuid: ""
+          driver-name: "gpu.nvidia.com"
+          k8s-device-name: "nvidia-t4"
+          cannot-coexist-with: [1,2,3]
+      fabricIdRange: '[1]'
+  fti_cdi:
+    credentials:
+      username: "username"
+      password: "password"
+      realm: "00000000-0000-0000-0000-000000000000"
+      client_id: "cdi"
+      client_secret: "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+    env:
+      CDI_ENDPOINT: "CDI_ENDPOINT_PLACEHOLDER"
+      CLUSTER_ID: ""
+      TENANT_ID: "00000000-0000-0000-0000-000000000000"
+    externalCA:
+      certificate: |
+        -----BEGIN CERTIFICATE-----
+        MIIDfzCCAmegAwIBAgIUSsWClAlmjalpXO97/a6StJNuawAwDQYJKoZIhvcNAQEL
+        BQAwRzELMAkGA1UEBhMCSlAxDjAMBgNVBAcMBVRva3lvMRAwDgYDVQQKDAdGdWpp
+        dHN1MRYwFAYDVQQDDA1Db0hESS1Nb2NrLUNBMB4XDTI2MDMwMjA2NDEyMFoXDTM2
+        MDIyODA2NDEyMFowRzELMAkGA1UEBhMCSlAxDjAMBgNVBAcMBVRva3lvMRAwDgYD
+        VQQKDAdGdWppdHN1MRYwFAYDVQQDDA1Db0hESS1Nb2NrLUNBMIIBIjANBgkqhkiG
+        9w0BAQEFAAOCAQ8AMIIBCgKCAQEAmmZAWKkvCe7nIptVU3UHk5T//zg8hUwZ6ynH
+        Ulfq9W5gCYxMsiEy2mUzM/xX7QJfBhFqJ5TynNf2Zt08Q4i/aPHf0tg0jCB2JHEf
+        mYtD54bPWQCQE1y2jOlmIwiuLpxUKZ0uVhOgzWXih+1Ps78RrJrI6b2hXiXgjYXA
+        BJ7vjwbwh0RpAd3uezuiupdkeeo+tpLLTu2Q07F7u0u4cEYpv1T+P6lZKp8XZTXb
+        48p8+5eBHrbaq6UIJ3sA+9IIetXGPzdFaeDRvAZb4K88X1egHIW6CJVr86eScOkN
+        JHqxonNC65ZD0aMOcI4xitAAUnLhqkW3yhnATzlpPjFjJXsMlwIDAQABo2MwYTAP
+        BgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIBBjAdBgNVHQ4EFgQU55CK6Hni
+        5MDO4XZKfnx2KVkKDFQwHwYDVR0jBBgwFoAU55CK6Hni5MDO4XZKfnx2KVkKDFQw
+        DQYJKoZIhvcNAQELBQADggEBAGiNnArn15mSVEKt2BWfK3TSuULeW/ElXdpoySYW
+        OxODiSjbL7l32cJoTdzsNvV3uVf5ukjf4MRhwj9BXjiessjIbkChBC1LP7AI9KmF
+        dqa2PuKBlo/tcpgk4miewiuaEvFZZ64kQB0gKjqD2i7x7gVLX7LM7Lh6etgedZ7I
+        QpeGE7mLD8zqvfra5mUEDvSjV4Saa2u2KyQmJtr3gDIngADfWpByrGKJlfBuyc5c
+        /k9ZBcoJqBAy4vaxpnkbW11/AMbFrOqR/0n9yWytFbjzSa8Cyi/WBG8uDoNn9EkE
+        +s3VKAU/D6BmXkF9ypCRBz9BQk2meJFa1c5fMeVYZIJ+FNY=
+        -----END CERTIFICATE-----
+    hostAliases:
+      - ip: "HOST_ALIAS_IP_PLACEHOLDER"
+        hostnames:
+          - "HOST_ALIAS_IP_PLACEHOLDER"
