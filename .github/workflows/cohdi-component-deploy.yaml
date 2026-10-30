@@ -1,0 +1,320 @@
+name: CoHDI Component Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      component:
+        description: 'Component to build and deploy'
+        required: true
+        type: choice
+        options:
+          - composable-dra-driver
+          - composable-resource-operator
+          - dynamic-device-scaler
+      image_tag:
+        description: 'Image tag — must be UNIQUE per build (IfNotPresent nodes never re-pull a reused tag). For a PR: pr-<PR#>-<head SHA first 7> (e.g. pr-16-afe5798). Otherwise e.g. test-<date><seq>'
+        required: true
+      build_ref:
+        description: 'Git ref/SHA of the component to build. Empty = default branch (upstream main). For a PR this MUST be set too — the tag is just a label; ref decides what gets built. Use the PR head SHA, or refs/pull/<PR#>/head'
+        required: false
+        default: ''
+  workflow_call:
+    inputs:
+      component:
+        description: 'Component to build and deploy'
+        required: true
+        type: string
+      image_tag:
+        description: 'Image tag — must be unique per build (e.g. pr-<PR#>-<sha7>)'
+        required: true
+        type: string
+      build_ref:
+        description: 'Git ref/SHA of the component to build (empty = default branch). When testing a PR, set this to the PR head — the tag alone does not select the code'
+        required: false
+        type: string
+        default: ''
+    outputs:
+      composable_dra_driver_tag:
+        description: 'Tag composable-dra-driver was deployed at'
+        value: ${{ jobs.build-and-deploy.outputs.composable_dra_driver_tag }}
+      composable_resource_operator_tag:
+        description: 'Tag composable-resource-operator was deployed at'
+        value: ${{ jobs.build-and-deploy.outputs.composable_resource_operator_tag }}
+      dynamic_device_scaler_tag:
+        description: 'Tag dynamic-device-scaler was deployed at'
+        value: ${{ jobs.build-and-deploy.outputs.dynamic_device_scaler_tag }}
+
+env:
+  REGISTRY: 10.128.0.21:5000
+
+jobs:
+  build-and-deploy:
+    runs-on: [self-hosted, ci-management]
+    outputs:
+      composable_dra_driver_tag: ${{ steps.plan.outputs.cdd_tag }}
+      composable_resource_operator_tag: ${{ steps.plan.outputs.cro_tag }}
+      dynamic_device_scaler_tag: ${{ steps.plan.outputs.dds_tag }}
+    steps:
+      - name: Setup kubeconfig
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_CICDVM }}" > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Checkout this repository (for cohdi-ci/values/)
+        uses: actions/checkout@v4
+      
+      - name: Generate GitHub App token for the component repos
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.COHDI_APP_ID }}
+          private-key: ${{ secrets.COHDI_APP_PRIVATE_KEY }}
+          owner: cohdi
+          repositories: composable-dra-driver,composable-resource-operator,dynamic-device-scaler
+          permission-contents: read
+      
+      - name: Plan per-component tags and builds
+        id: plan
+        run: |
+          set -euo pipefail
+          TARGET="${{ inputs.component }}"
+          TOKEN="${{ steps.app-token.outputs.token }}"
+
+          APP_BOT="9tq1uvk1riibxjguk3o1aqsc7dq4wwqjja[bot]"
+          ORG="CoHDI"
+          
+          if [ "${{ github.triggering_actor }}" = "$APP_BOT" ]; then
+            echo "Actor OK: dispatched by the org App (the trigger workflow gated the human actor)"
+          else
+            ROLE=$(GH_TOKEN=$TOKEN gh api "repos/$ORG/$TARGET/collaborators/${{ github.triggering_actor }}/permission" --jq .role_name || true)
+            if [ "$ROLE" != "admin" ] && [ "$ROLE" != "maintain" ]; then
+              echo "ERROR: ${{ github.triggering_actor }} (role: ${ROLE:-unknown}) — running the CoHDI CI requires the maintain role or higher on $ORG/$TARGET"
+              exit 1
+            fi
+            echo "Actor OK: ${{ github.triggering_actor }} (role: $ROLE)"
+          fi
+
+          get_deployed_tag () {
+            case "$1" in
+              composable-dra-driver)
+                kubectl get deployment composable-dra-driver -n composable-dra \
+                  -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null | sed 's/^.*://' || true
+                ;;
+              composable-resource-operator)
+                kubectl get deployment composable-resource-operator-controller-manager -n composable-resource-operator-system \
+                  -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null | sed 's/^.*://' || true
+                ;;
+              dynamic-device-scaler)
+                kubectl get deployment dds-controller-manager -n composable-dra \
+                  -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null | sed 's/^.*://' || true
+                ;;
+            esac
+          }
+
+          latest_main_sha () {
+            GH_TOKEN=$TOKEN gh api "repos/$ORG/$1/branches/main" --jq .commit.sha || true
+          }            
+
+          for c in composable-dra-driver composable-resource-operator dynamic-device-scaler; do
+            case "$c" in
+              composable-dra-driver) K=cdd ;;
+              composable-resource-operator) K=cro ;;
+              dynamic-device-scaler) K=dds ;;
+            esac
+            if [ "$c" = "$TARGET" ]; then
+              TAG="${{ inputs.image_tag }}"
+              REF="${{ inputs.build_ref }}"
+              BUILD=true
+            else
+              SHA=$(latest_main_sha "$c")
+              if [ -z "$SHA" ]; then
+                echo "ERROR: could not resolve latest main SHA for $c"
+                exit 1
+              fi
+              TAG="main-${SHA:0:7}"
+              REF="$SHA"
+              CURRENT=$(get_deployed_tag "$c")
+              if [ "$CURRENT" = "$TAG" ]; then
+                BUILD=false
+              else
+                BUILD=true
+              fi
+              echo "$c is deployed at '${CURRENT:-<not deployed>}', latest main is $TAG"
+            fi
+            echo "$c -> tag=$TAG build=$BUILD"
+            {
+              echo "${K}_tag=$TAG"
+              echo "${K}_ref=$REF"
+              echo "${K}_build=$BUILD"
+            } >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Checkout cohdi-chart
+        run: |
+          set -euo pipefail
+          CHART_REF="v0.2.2"
+          rm -rf /tmp/cohdi-chart
+          git clone --depth 1 --branch "$CHART_REF" https://github.com/CoHDI/cohdi-chart.git /tmp/cohdi-chart
+          echo "cohdi-chart: $CHART_REF ($(git -C /tmp/cohdi-chart rev-parse HEAD))"
+
+      - name: Build and push required images
+        run: |
+          set -euo pipefail
+          build_one () {
+            local COMPONENT="$1" TAG="$2" REF="$3"
+            echo "=== building $COMPONENT:$TAG (ref: ${REF:-default branch}) ==="
+            
+            GIT_AUTH=()
+            rm -rf /tmp/$COMPONENT
+            git clone https://github.com/CoHDI/$COMPONENT.git /tmp/$COMPONENT
+
+            if [ -n "$REF" ]; then
+              cd /tmp/$COMPONENT
+              if ! git "${GIT_AUTH[@]}" fetch origin "$REF" || ! git checkout FETCH_HEAD; then
+                echo "ERROR: could not fetch/checkout ref '$REF' — does it exist on compsysg/$COMPONENT? (For a PR use its head SHA or refs/pull/<n>/head)"
+                exit 1
+              fi
+            fi
+            cd /tmp/$COMPONENT
+            rm -rf /tmp/$COMPONENT/.git
+            docker build -t $REGISTRY/cohdi/$COMPONENT:$TAG .
+            docker push $REGISTRY/cohdi/$COMPONENT:$TAG
+          }
+          if [ "${{ steps.plan.outputs.cdd_build }}" = "true" ]; then
+            build_one composable-dra-driver "${{ steps.plan.outputs.cdd_tag }}" "${{ steps.plan.outputs.cdd_ref }}"
+          fi
+          if [ "${{ steps.plan.outputs.cro_build }}" = "true" ]; then
+            build_one composable-resource-operator "${{ steps.plan.outputs.cro_tag }}" "${{ steps.plan.outputs.cro_ref }}"
+          fi
+          if [ "${{ steps.plan.outputs.dds_build }}" = "true" ]; then
+            build_one dynamic-device-scaler "${{ steps.plan.outputs.dds_tag }}" "${{ steps.plan.outputs.dds_ref }}"
+          fi
+
+      - name: Get ci-mock Service IP
+        run: |
+          set -euo pipefail
+          kubectl apply -f .github/manifests/mock-server.yaml
+          CI_MOCK_IP=$(kubectl get service mock-server -n default -o jsonpath='{.spec.clusterIP}')
+          if [ -z "$CI_MOCK_IP" ] || [ "$CI_MOCK_IP" = "None" ]; then
+            echo "ERROR: could not determine mock-server ClusterIP"
+            exit 1
+          fi
+          echo "CI_MOCK_IP=$CI_MOCK_IP"
+          echo "CI_MOCK_IP=$CI_MOCK_IP" >> $GITHUB_ENV
+
+      - name: Create values file
+        run: |
+          set -euo pipefail
+
+          sed "s|CDI_ENDPOINT_PLACEHOLDER|https://$CI_MOCK_IP|g" cohdi-ci/values/cohdi-values.yaml | \
+          sed "s|HOST_ALIAS_IP_PLACEHOLDER|$CI_MOCK_IP|g" > /tmp/cohdi-values.yaml
+
+          if [ ! -s /tmp/cohdi-values.yaml ]; then
+            echo "ERROR: generated /tmp/cohdi-values.yaml is empty — check cohdi-ci/values/cohdi-values.yaml"
+            exit 1
+          fi
+
+      - name: Write webhook certs values from secret
+        run: |
+          set -euo pipefail
+          cat > /tmp/cohdi-cro-webhook-certs.yaml <<'WEBHOOK_EOF'
+          composable-resource-operator:
+            common:
+          ${{ secrets.COHDI_CRO_WEBHOOK_CERTS }}
+          WEBHOOK_EOF
+          if ! grep -q "BEGIN PRIVATE KEY" /tmp/cohdi-cro-webhook-certs.yaml; then
+            echo "ERROR: COHDI_CRO_WEBHOOK_CERTS secret looks missing or malformed"
+            exit 1
+          fi
+
+      - name: Recover stuck cohdi Helm release
+        run: |
+          set -euo pipefail
+          STATUS=$(helm status cohdi -n cohdi -o json 2>/dev/null | jq -r '.info.status // empty' || true)
+          if [ -n "$STATUS" ] && [ "$STATUS" != "deployed" ]; then
+            echo "cohdi release is in unexpected state '$STATUS' — attempting recovery"
+            if ! helm rollback cohdi -n cohdi --wait --timeout=120s; then
+              echo "Rollback failed, uninstalling so the next step does a fresh install"
+              helm uninstall cohdi -n cohdi || true
+            fi
+          fi
+
+      - name: Wait for terminating namespaces to clear
+        run: |
+          set -euo pipefail
+          for ns in cohdi composable-dra composable-resource-operator-system; do
+            for i in $(seq 1 30); do
+              PHASE=$(kubectl get ns "$ns" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+              if [ "$PHASE" != "Terminating" ]; then
+                break
+              fi
+              echo "namespace $ns is Terminating, waiting... ($i/30)"
+              if [ "$i" -eq 30 ]; then
+                echo "ERROR: namespace $ns stuck in Terminating"
+                kubectl get ns "$ns" -o yaml | tail -20 || true
+                exit 1
+              fi
+              sleep 10
+            done
+          done
+
+      - name: Deploy cohdi-chart with all three component images pinned
+        run: |
+          set -euo pipefail
+
+          helm upgrade --install cohdi /tmp/cohdi-chart \
+            -n cohdi \
+            --create-namespace \
+            -f /tmp/cohdi-values.yaml \
+            -f cohdi-ci/values/cohdi-cro-values.yaml \
+            -f /tmp/cohdi-cro-webhook-certs.yaml \
+            --set composable-dra-driver.common.image.registry=$REGISTRY \
+            --set composable-dra-driver.common.image.repository=cohdi/composable-dra-driver \
+            --set composable-dra-driver.common.image.tag=${{ steps.plan.outputs.cdd_tag }} \
+            --set composable-resource-operator.common.image.registry=$REGISTRY \
+            --set composable-resource-operator.common.image.repository=cohdi/composable-resource-operator \
+            --set composable-resource-operator.common.image.tag=${{ steps.plan.outputs.cro_tag }} \
+            --set dynamic-device-scaler.common.image.registry=$REGISTRY \
+            --set dynamic-device-scaler.common.image.repository=cohdi/dynamic-device-scaler \
+            --set dynamic-device-scaler.common.image.tag=${{ steps.plan.outputs.dds_tag }} \
+            --wait --timeout=300s
+
+      - name: Dump diagnostics on failure
+        if: failure()
+        run: |
+          set -uo pipefail
+          echo "=== helm status ==="
+          helm status cohdi -n cohdi || true
+          echo "=== pods ==="
+          for ns in composable-dra composable-resource-operator-system cohdi; do
+            echo "--- $ns ---"
+            kubectl get pods -n "$ns" -o wide || true
+          done
+          echo "=== describe not-ready pods ==="
+          for ns in composable-dra composable-resource-operator-system; do
+            kubectl get pods -n "$ns" --no-headers 2>/dev/null | awk '$2 ~ /^0\// {print $1}' | while read -r pod; do
+              echo "----- $ns/$pod -----"
+              kubectl describe pod "$pod" -n "$ns" | tail -25 || true
+            done
+          done
+          echo "=== node network conditions ==="
+          kubectl get nodes -o custom-columns='NAME:.metadata.name,READY:.status.conditions[?(@.type=="Ready")].status,NETUNAVAIL:.status.conditions[?(@.type=="NetworkUnavailable")].status' || true
+          echo "=== flannel pods ==="
+          kubectl get pods -n kube-flannel -o wide || true
+          echo "=== recent events ==="
+          kubectl get events -A --sort-by=.lastTimestamp 2>/dev/null | tail -30 || true
+
+      - name: Verify deployment
+        run: |
+          set -euo pipefail
+          echo "=== Pods ==="
+          kubectl get pods -n composable-dra -o wide
+          kubectl get pods -n composable-resource-operator-system -o wide
+          echo "=== Deployed image tags ==="
+          for ns in composable-dra composable-resource-operator-system; do
+            kubectl get pods -n "$ns" -o jsonpath='{range .items[*]}{.metadata.name}{": "}{range .spec.containers[*]}{.image}{" "}{end}{"\n"}{end}'
+          done
+          echo "=== ResourceSlices ==="
+          kubectl get resourceslices
