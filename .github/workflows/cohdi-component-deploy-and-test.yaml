@@ -1,0 +1,17 @@
+name: CoHDI Component Deploy and Test
+on:
+  workflow_dispatch:
+    inputs:
+      component:
+        required: false
+      pr_number:
+        required: false
+      image_tag:
+        required: false
+      build_ref:
+        required: false
+jobs:
+  stub:
+    runs-on: [self-hosted, ci-management]
+    steps:
+      - run: echo "main stub — dispatch with --ref <branch> to run the real pipeline (ref=${{ github.ref }})"
