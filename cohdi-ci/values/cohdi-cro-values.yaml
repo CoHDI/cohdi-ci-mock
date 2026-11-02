@@ -1,0 +1,23 @@
+# Based on the CRO subchart's default values in the upstream CoHDI chart:
+#   https://github.com/CoHDI/cohdi-chart/blob/main/charts/composable-resource-operator/values.yaml
+# (wrapped under the composable-resource-operator: key as a parent-chart
+# override). Local changes for this environment:
+#   - deployPrivilegedAgent: false -> true (note: the agent is a stub, see
+#     the README's known issues)
+#   - webhook: block (CA bundle / server cert / PRIVATE key — placeholders
+#     upstream) moved out of git into the COHDI_CRO_WEBHOOK_CERTS secret,
+#     materialized as a separate values file at deploy time
+#   - image registry/repository/tag dropped: the pipeline pins them with
+#     --set on every deploy (only pullPolicy is taken from here)
+composable-resource-operator:
+  common:
+    deployPrivilegedAgent: true
+    name: composable-resource-operator
+    image:
+      pullPolicy: IfNotPresent
+    managerEnv:
+      DEVICE_RESOURCE_TYPE: "DRA"
+      CDI_PROVIDER_TYPE: "FTI_CDI"
+  fti_cdi:
+    managerEnv:
+      FTI_CDI_API_TYPE: "FM"

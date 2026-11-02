@@ -1,17 +1,245 @@
 name: CoHDI Component Deploy and Test
+
 on:
   workflow_dispatch:
     inputs:
       component:
-        required: false
+        description: 'Component to build and deploy'
+        required: true
+        type: choice
+        options:
+          - composable-dra-driver
+          - composable-resource-operator
+          - dynamic-device-scaler
       pr_number:
+        description: "PR number on the component's repo to test (resolves head SHA and tag automatically; requires the maintain role or higher there)"
         required: false
+        default: ''
       image_tag:
+        description: 'Image tag for a direct (non-PR) run, e.g. test-1. Ignored when pr_number is set'
         required: false
+        default: ''
       build_ref:
+        description: 'Git ref to build — a branch name, tag, commit SHA, or refs/pull/<n>/head (empty = default branch). Ignored when pr_number is set'
         required: false
+        default: ''
+
+concurrency:
+  group: cohdi-component-deploy-test
+  cancel-in-progress: false
+  queue: max
+
 jobs:
-  stub:
-    runs-on: [self-hosted, ci-management]
+  resolve-inputs:
+    runs-on: [ self-hosted, ci-management ]
+    outputs:
+      image_tag: ${{ steps.resolve.outputs.image_tag }}
+      build_ref: ${{ steps.resolve.outputs.build_ref }}
     steps:
-      - run: echo "main stub — dispatch with --ref <branch> to run the real pipeline (ref=${{ github.ref }})"
+      - name: Generate GitHub App token for the component repo
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.COHDI_APP_ID }}
+          private-key: ${{ secrets.COHDI_APP_PRIVATE_KEY }}
+          owner: cohdi
+          repositories: ${{ inputs.component }}
+
+      - name: Resolve run parameters
+        id: resolve
+        run: |
+          set -euo pipefail
+          APP_BOT="9tq1uvk1riibxjguk3o1aqsc7dq4wwqjja[bot]"
+          ORG="CoHDI"
+
+          REPO="$ORG/${{ inputs.component }}"
+          TOKEN="${{ steps.app-token.outputs.token }}"
+
+          if [ "${{ github.triggering_actor }}" = "$APP_BOT" ]; then
+            echo "Actor OK: dispatched by the org App (the trigger workflow gated the human actor)"
+          else
+            ROLE=$(GH_TOKEN=$TOKEN gh api "repos/$REPO/collaborators/${{ github.triggering_actor }}/permission" --jq .role_name || true)
+            if [ "$ROLE" != "admin" ] && [ "$ROLE" != "maintain" ]; then
+              echo "ERROR: ${{ github.triggering_actor }} (role: ${ROLE:-unknown}) — running the CoHDI CI requires the maintain role or higher on $REPO"
+              exit 1
+            fi
+            echo "Actor OK: ${{ github.triggering_actor }} (role: $ROLE)"
+          fi
+
+          PR="${{ inputs.pr_number }}"
+          if [ -z "$PR" ]; then
+            if [ -z "${{ inputs.image_tag }}" ]; then
+              echo "ERROR: either pr_number or image_tag must be given"
+              exit 1
+            fi
+            {
+              echo "image_tag=${{ inputs.image_tag }}"
+              echo "build_ref=${{ inputs.build_ref }}"
+            } >> "$GITHUB_OUTPUT"
+            echo "Direct mode: tag=${{ inputs.image_tag }} ref=${{ inputs.build_ref }}"
+            exit 0
+          fi
+
+          SHA=$(GH_TOKEN=$TOKEN gh api "repos/$REPO/pulls/$PR" --jq .head.sha || true)
+          if [ -z "$SHA" ]; then
+            echo "ERROR: could not resolve the head SHA of $REPO PR #$PR (does the PR exist?)"
+            exit 1
+          fi
+          {
+            echo "image_tag=pr-$PR-${SHA:0:7}"
+            echo "build_ref=$SHA"
+          } >> "$GITHUB_OUTPUT"
+          echo "PR mode: $REPO#$PR head=$SHA"
+
+          GH_TOKEN=$TOKEN gh api -X DELETE "repos/$REPO/issues/$PR/labels/cohdi-ci-passed" >/dev/null 2>&1 || true
+
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          BODY="**CoHDI CI started** for head \`${SHA:0:7}\` — [follow the run]($RUN_URL).
+
+          On success the \`cohdi-ci-passed\` label is added to this PR; for anything else, check the run."
+          GH_TOKEN=$TOKEN gh api -X POST "repos/$REPO/issues/$PR/comments" -f body="$BODY" >/dev/null || true
+
+  start-instances:
+    needs: resolve-inputs
+    uses: ./.github/workflows/startCIInstances.yaml
+    secrets: inherit
+
+  wait-for-cluster-ready:
+    needs: start-instances
+    runs-on: [ self-hosted, ci-management ]
+    steps:
+      - name: Setup kubeconfig
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_CICDVM }}" > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Wait for API server to be reachable
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if kubectl get nodes >/dev/null 2>&1; then
+              echo "API server is reachable"
+              break
+            fi
+            echo "Waiting for API server... ($i/30)"
+            if [ "$i" -eq 30 ]; then
+              echo "ERROR: API server did not become reachable in time"
+              exit 1
+            fi
+            sleep 10
+          done
+
+      - name: Wait for ci-cp and ci-worker to be Ready
+        run: |
+          set -euo pipefail
+          for node in ci-cp ci-worker; do
+            echo "Waiting for node $node to be Ready..."
+            kubectl wait --for=condition=Ready "node/$node" --timeout=300s
+          done
+
+      - name: Wait for CNI (flannel) to be functional
+        run: |
+          set -euo pipefail
+          for node in ci-cp ci-worker; do
+            echo "Waiting for NetworkUnavailable=False on $node..."
+            if ! kubectl wait --for=condition=NetworkUnavailable=false "node/$node" --timeout=300s; then
+              echo "ERROR: CNI (flannel) is not functional on $node — new pods cannot get network."
+              echo "Check the kube-flannel pod on that node; re-run once it recovers."
+              kubectl get pods -n kube-flannel -o wide || true
+              exit 1
+            fi
+          done
+
+          echo "Waiting for the flannel daemonset to be stably ready..."
+          STREAK=0
+          for i in $(seq 1 60); do
+            DESIRED=$(kubectl get ds kube-flannel-ds -n kube-flannel -o jsonpath='{.status.desiredNumberScheduled}')
+            READY=$(kubectl get ds kube-flannel-ds -n kube-flannel -o jsonpath='{.status.numberReady}')
+            if [ -n "$DESIRED" ] && [ "$DESIRED" -gt 0 ] && [ "$READY" = "$DESIRED" ]; then
+              STREAK=$((STREAK+1))
+              if [ "$STREAK" -ge 2 ]; then
+                echo "flannel stable ($READY/$DESIRED, confirmed twice)"
+                break
+              fi
+            else
+              STREAK=0
+            fi
+            echo "flannel not stable yet (${READY:-0}/${DESIRED:-?}, streak=$STREAK) ($i/60)"
+            if [ "$i" -eq 60 ]; then
+              echo "ERROR: flannel did not stabilize in time"
+              kubectl get pods -n kube-flannel -o wide || true
+              exit 1
+            fi
+            sleep 30
+          done
+
+  deploy:
+    needs: [ resolve-inputs, wait-for-cluster-ready ]
+    uses: ./.github/workflows/cohdi-component-deploy.yaml
+    with:
+      component: ${{ inputs.component }}
+      image_tag: ${{ needs.resolve-inputs.outputs.image_tag }}
+      build_ref: ${{ needs.resolve-inputs.outputs.build_ref }}
+    secrets: inherit
+
+  test:
+    needs: deploy
+    uses: ./.github/workflows/cohdi-test-cicdvm.yaml
+    with:
+      composable_dra_driver_tag: ${{ needs.deploy.outputs.composable_dra_driver_tag }}
+      composable_resource_operator_tag: ${{ needs.deploy.outputs.composable_resource_operator_tag }}
+      dynamic_device_scaler_tag: ${{ needs.deploy.outputs.dynamic_device_scaler_tag }}
+    secrets: inherit
+
+  label-pr:
+    if: inputs.pr_number != ''
+    needs: [ resolve-inputs, test ]
+    runs-on: [ self-hosted, ci-management ]
+    steps:
+      - name: Generate GitHub App token for the component repo
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.COHDI_APP_ID }}
+          private-key: ${{ secrets.COHDI_APP_PRIVATE_KEY }}
+          owner: cohdi
+          repositories: ${{ inputs.component }}
+
+      - name: Add the success label to the PR
+        env:
+          TESTED_SHA: ${{ needs.resolve-inputs.outputs.build_ref }}
+        run: |
+          set -euo pipefail
+          TOKEN="${{ steps.app-token.outputs.token }}"
+          ORG="CoHDI"
+          REPO="$ORG/${{ inputs.component }}"
+          CURRENT=$(GH_TOKEN=$TOKEN gh api "repos/$REPO/pulls/${{ inputs.pr_number }}" --jq .head.sha || true)
+          if [ "$CURRENT" != "$TESTED_SHA" ]; then
+            echo "PR head moved while the pipeline ran (tested ${TESTED_SHA:0:7}, now ${CURRENT:0:7}) — not labeling the untested head. Re-add run-cohdi-ci to test the current head."
+            exit 0
+          fi
+          
+          GH_TOKEN=$TOKEN gh api -X POST "repos/$REPO/statuses/$TESTED_SHA" \
+            -f state=success \
+            -f context="cohdi-ci/deploy-and-test" \
+            -f description="CoHDI CI pipeline succeeded" \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >/dev/null
+          
+          GH_TOKEN=$TOKEN gh api -X POST "repos/$REPO/labels" \
+            -f name=cohdi-ci-passed -f color=0e8a16 \
+            -f description="CoHDI CI pipeline succeeded for the latest tested head" >/dev/null 2>&1 || true
+
+          if ! GH_TOKEN=$TOKEN gh api -X POST "repos/$REPO/issues/${{ inputs.pr_number }}/labels" -f "labels[]=cohdi-ci-passed"; then
+            echo "ERROR: could not add the label to PR #${{ inputs.pr_number }}"
+            exit 1
+          fi
+          echo "Labeled $REPO#${{ inputs.pr_number }} with cohdi-ci-passed"
+
+
+  stop-instances:
+    if: always()
+    needs: [ start-instances, wait-for-cluster-ready, deploy, test ]
+    uses: ./.github/workflows/stopCIInstances.yaml
+    secrets: inherit
